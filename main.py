@@ -20,21 +20,43 @@ async def websocket_endpoint(
     username: str = Query(...)
 ):
 
-    await manager.connect(websocket)
+    # await manager.connect(websocket) # for broadcast channel, all the sockets will be in one single list and one message will go to all sockets, to fix this we can use dictionary
+    await manager.connect(websocket, username) # for individual channel, we can use dictionary to store the sockets with their usernames as keys
 
     print(f"{username} connected")
 
     try:
         while True:
-            data = await websocket.receive_text()
+            data = await websocket.receive_json()
+            print(data)
+            recipient = data["to"]
+            message = data["message"]
 
-            await manager.broadcast(
-                f"{username}: {data}"
+            await manager.send_personal_message(
+                f"{username}: {message}",
+                recipient
             )
 
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        # manager.disconnect(websocket) # for broadcast channel, all the sockets will be in one single list and one message will go to all sockets, to fix this we can use dictionary
+        manager.disconnect(websocket, username) # for individual channel, we can use dictionary to store
         print(f"{username} disconnected")
+
+# @app.websocket("/ws/chat/personal")
+# async def send_personal(message: str, username: str, websocket: WebSocket):
+#
+#     await manager.connect(websocket, username) # for individual channel, we can use dictionary to store the sockets with their usernames as keys
+#     await manager.send_personal_message(message, username)
+#
+#     print("connection established with " + username)
+#
+#     try:
+#         while True:
+#             data = await manager.active_connections[username].receive_json()
+#             print(f"{username}: {data}")
+#     except WebSocketDisconnect:
+#         manager.disconnect(manager.active_connections[username], username)
+#         print(f"{username} disconnected")
 
 
 if __name__ == "__main__":
