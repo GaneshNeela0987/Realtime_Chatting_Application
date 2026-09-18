@@ -27,7 +27,12 @@ async def websocket_endpoint(
 
     print(f"{username} connected")
 
-    await manager.broadcast(f"{username} joined the chat")
+    data = {
+        "type": "user_joined",
+        "message": f"{username} joined the chat"
+    }
+
+    await manager.broadcast(data)
 
     try:
         while True:
@@ -47,7 +52,12 @@ async def websocket_endpoint(
             message = chat_message.message
 
             sent = await manager.send_personal_message(
-                f"{username}: {message}",
+                {
+                    "type": "private_message",
+                    "from": username,
+                    "to": recipient,
+                    "message": message
+                },
                 recipient
             )
             if not sent:
@@ -57,6 +67,28 @@ async def websocket_endpoint(
         # manager.disconnect(websocket) # for broadcast channel, all the sockets will be in one single list and one message will go to all sockets, to fix this we can use dictionary
         manager.disconnect(websocket, username)  # for individual channel, we can use dictionary to store
         print(f"{username} disconnected")
+
+
+@app.websocket("/ws/online")
+async def online_users(websocket: WebSocket):
+
+    await websocket.accept()
+
+    try:
+
+        while True:
+
+            await websocket.receive_text()
+
+            users = list(manager.active_connections.keys())
+
+            await websocket.send_json({
+                "type": "online_users",
+                "users": users
+            })
+
+    except WebSocketDisconnect:
+        print("Online users client disconnected")
 
 
 # @app.websocket("/ws/chat/personal")
