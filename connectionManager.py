@@ -4,6 +4,7 @@ class ConnectionManager:
     def __init__(self):
         # self.active_connections: list[WebSocket] = [] # for broadcast channel, all the sockets will be in one single list and one message will go to all sockets, to fix this we can use dictionary
         self.active_connections:dict[str,WebSocket] = {}  # for broadcast channel, all the sockets will be in one single list and one message will go to all sockets, to fix this we can use dictionary
+        self.online_xonnections:list[WebSocket] = []
 
     async def connect(self, websocket: WebSocket, username: str):
         await websocket.accept()
@@ -43,3 +44,22 @@ class ConnectionManager:
             await websocket.send_json(data)
             return True
         return False
+
+    async def connect_online(
+        self,
+        websocket: WebSocket
+    ):
+
+        await websocket.accept()
+
+        self.online_connections.append(websocket)
+
+
+    def disconnect_online(
+        self,
+        websocket: WebSocket
+    ):
+
+        if websocket in self.online_connections:
+
+            self.online_connections.remove(websocket)
