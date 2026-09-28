@@ -391,3 +391,14 @@ class ConnectionManager:
                 await websocket.send_json(data)
 
         return True
+
+    # =====================================================
+    # GET ROOM MEMBERS
+    # =====================================================
+
+    def get_room_members(self,room: str):
+
+        if room not in self.rooms:
+            return None
+
+        return list(self.rooms[room])

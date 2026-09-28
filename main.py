@@ -492,6 +492,44 @@ async def room_websocket(
                 )
                 continue
 
+            # =================================================
+            # GET ROOM MEMBERS
+            # =================================================
+
+            if message_type == "get_room_members":
+                room = data.get("room")
+
+                if not room:
+                    await websocket.send_json({
+                        "type":"error",
+                        "message":"Room name is required"
+                    })
+                    continue
+
+                # -------------------------------------------------
+                # CHECK ROOM EXISTS
+                # -------------------------------------------------
+
+                members = manager.get_room_members(room)
+
+                if members is None:
+                    await websocket.send_json({
+                        "type":"error",
+                        "message":f"Room '{room}' does not exist"
+                    })
+                    continue
+
+                # -------------------------------------------------
+                # SEND MEMBERS
+                # -------------------------------------------------
+
+                await websocket.send_json({
+                    "type":"room_members",
+                    "room":room,
+                    "members":members
+                })
+                continue
+
             # ---------------------------------------------
             # UNKNOWN MESSAGE TYPE
             # ---------------------------------------------
