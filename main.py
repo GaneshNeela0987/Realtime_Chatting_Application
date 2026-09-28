@@ -276,7 +276,7 @@ async def websocket_endpoint(
 
     except WebSocketDisconnect:
 
-        manager.disconnect(websocket,username)
+        manager.disconnect(username)
 
         # Notify personal-chat clients
         await manager.broadcast({
@@ -330,15 +330,11 @@ async def online_users(
 # =========================================================
 
 @app.websocket("/ws/room")
-async def room_websocket(
-    websocket: WebSocket,
-    username: str = Query(...)
-):
+async def room_websocket(websocket: WebSocket,username: str = Query(...)):
 
     # -----------------------------------------------------
     # CONNECT ROOM SOCKET
     # -----------------------------------------------------
-
     connected = await manager.connect_room(websocket,username)
 
     if not connected:
@@ -543,15 +539,26 @@ async def room_websocket(
 
 
     except WebSocketDisconnect:
+        # Get rooms before removing the user
+        rooms_left = manager.get_user_rooms(username)
+
+        # Notify remaining members
+        for room in rooms_left:
+            await manager.notify_room_members(
+                room,
+                {
+                    "type": "user_left_room",
+                    "username": username,
+                    "room": room
+                },
+                exclude_username=username
+            )
+
         # Remove room WebSocket connection
-        manager.disconnect_room(
-            username
-        )
+        manager.disconnect_room(username)
 
         # Remove user from every room
-        rooms_left = manager.leave_all_rooms(
-            username
-        )
+        manager.leave_all_rooms(username)
 
         print(
             f"{username} disconnected "
@@ -562,7 +569,6 @@ async def room_websocket(
             f"{username} removed from rooms: "
             f"{rooms_left}"
         )
-
 
 
 

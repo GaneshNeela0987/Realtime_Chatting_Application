@@ -80,7 +80,7 @@
 #             await connection.send_json(data)
 
 
-from fastapi import WebSocket
+from fastapi import WebSocket, WebSocketDisconnect
 
 
 class ConnectionManager:
@@ -118,11 +118,7 @@ class ConnectionManager:
     # PERSONAL CHAT
     # =====================================================
 
-    async def connect(
-        self,
-        websocket: WebSocket,
-        username: str
-    ):
+    async def connect(self,websocket: WebSocket,username: str):
 
         await websocket.accept()
 
@@ -141,43 +137,37 @@ class ConnectionManager:
 
         return True
 
-    def disconnect(
-        self,
-        websocket: WebSocket,
-        username: str
-    ):
+    def disconnect(self, username: str):
 
-        self.active_connections.pop(
-            username,
-            None
-        )
+        self.active_connections.pop(username,None)
 
     # =====================================================
     # PERSONAL CHAT BROADCAST
     # =====================================================
 
-    async def broadcast(
-        self,
-        data: dict
-    ):
+    async def broadcast(self,data: dict):
 
-        for connection in self.active_connections.values():
+        disconnected_users =[]
 
-            await connection.send_json(data)
+        for username, connection in self.active_connections.items():
+
+            try:
+                await connection.send_json(data)
+
+            except WebSocketDisconnect:
+
+                disconnected_users.append(username)
+
+        for username in disconnected_users:
+            self.active_connections.pop(username,None)
 
     # =====================================================
     # PERSONAL MESSAGE
     # =====================================================
 
-    async def send_personal_message(
-        self,
-        data: dict,
-        username: str
-    ):
+    async def send_personal_message(self,data: dict,username: str):
 
-        websocket = self.active_connections.get(
-            username
-        )
+        websocket = self.active_connections.get(username)
 
         if websocket:
 
@@ -191,55 +181,49 @@ class ConnectionManager:
     # ONLINE / PRESENCE CONNECTIONS
     # =====================================================
 
-    async def connect_online(
-        self,
-        websocket: WebSocket
-    ):
+    async def connect_online(self,websocket: WebSocket):
 
         await websocket.accept()
 
-        self.online_connections.append(
-            websocket
-        )
+        self.online_connections.append(websocket)
 
-    def disconnect_online(
-        self,
-        websocket: WebSocket
-    ):
+    def disconnect_online(self,websocket: WebSocket):
 
         if websocket in self.online_connections:
 
-            self.online_connections.remove(
-                websocket
-            )
+            self.online_connections.remove(websocket)
 
     async def broadcast_presence(self):
 
-        users = list(
-            self.active_connections.keys()
-        )
+        users = list(self.active_connections.keys())
 
         data = {
             "type": "online_users",
             "users": users
         }
 
-        for connection in self.online_connections:
+        disconnected_connections = []
 
-            await connection.send_json(data)
+        for connection in list(self.online_connections):
+
+            try:
+                await connection.send_json(data)
+
+            except WebSocketDisconnect:
+                disconnected_connections.append(connection)
+
+        # Remove dead presence connections
+        for connection in disconnected_connections:
+            if connection in self.online_connections:
+                self.online_connections.remove(connection)
 
     # =====================================================
     # ROOM CONNECTIONS
     # =====================================================
 
-    async def connect_room(
-        self,
-        websocket: WebSocket,
-        username: str
-    ):
+    async def connect_room(self,websocket: WebSocket,username: str):
 
         await websocket.accept()
-
         if username in self.room_connections:
 
             await websocket.send_json({
@@ -258,43 +242,27 @@ class ConnectionManager:
 
         return True
 
-    def disconnect_room(
-        self,
-        username: str
-    ):
+    def disconnect_room(self,username: str):
 
-        self.room_connections.pop(
-            username,
-            None
-        )
+        self.room_connections.pop(username,None)
 
     # =====================================================
     # JOIN ROOM
     # =====================================================
 
-    def join_room(
-        self,
-        username: str,
-        room: str
-    ):
+    def join_room(self,username: str,room: str):
 
         if room not in self.rooms:
 
             self.rooms[room] = set()
 
-        self.rooms[room].add(
-            username
-        )
+        self.rooms[room].add(username)
 
     # =====================================================
     # LEAVE ROOM
     # =====================================================
 
-    def leave_room(
-        self,
-        username: str,
-        room: str
-    ):
+    def leave_room(self,username: str,room: str):
 
         if room not in self.rooms:
             return False
@@ -314,13 +282,9 @@ class ConnectionManager:
     # LEAVE ALL ROOMS
     # =====================================================
 
-    def leave_all_rooms(
-        self,
-        username: str
-    ):
+    def leave_all_rooms(self,username: str):
 
         rooms_left = []
-
         # Use list() because rooms may be deleted
         # while we are iterating
         for room in list(self.rooms.keys()):
@@ -351,14 +315,42 @@ class ConnectionManager:
         if room not in self.rooms:
             return
 
+        disconnected_users = []
+
         for username in self.rooms[room]:
             if username == exclude_username:
                 continue
 
+
             websocket = self.room_connections.get(username)
 
-            if websocket:
+            # No active room connection
+            if not websocket:
+                disconnected_users.append(username)
+                continue
+
+            try:
                 await websocket.send_json(data)
+
+            except WebSocketDisconnect:
+                disconnected_users.append(username)
+
+        for username in disconnected_users:
+
+            self.room_connections.pop(
+                username,
+                None
+            )
+
+            if room in self.rooms:
+                self.rooms[room].discard(
+                    username
+                )
+
+        if room in self.rooms:
+
+            if not self.rooms[room]:
+                del self.rooms[room]
 
     # =====================================================
     # GET USER ROOMS
@@ -381,14 +373,34 @@ class ConnectionManager:
         if room not in self.rooms:
             return False
 
+        disconnected_users = []
+
         users = self.rooms[room]
 
         for username in users:
 
             websocket = self.room_connections.get(username)
 
-            if websocket:
+            if not websocket:
+                disconnected_users.append(username)
+                continue
+
+            try:
                 await websocket.send_json(data)
+
+            except WebSocketDisconnect:
+                disconnected_users.append(username)
+
+        for username in disconnected_users:
+
+            self.room_connections.pop(username,None)
+
+            if room in self.rooms:
+                self.rooms[room].discard(username)
+
+        if room in self.rooms:
+            if not self.rooms[room]:
+                del self.rooms[room]
 
         return True
 
