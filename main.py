@@ -153,7 +153,7 @@ from sqlalchemy.orm import Session
 from fastapi import Depends
 
 from database.database import get_db
-from database.models import User, Message
+from database.models import User, Message, Room, RoomMember, RoomMessage
 
 manager = ConnectionManager()
 
@@ -268,7 +268,6 @@ async def websocket_endpoint(websocket: WebSocket,username: str = Query(...),db:
     # -----------------------------------------------------
 
     try:
-
         while True:
 
             data = await websocket.receive_json()
@@ -555,11 +554,12 @@ async def online_users(
 # =========================================================
 
 @app.websocket("/ws/room")
-async def room_websocket(websocket: WebSocket,username: str = Query(...)):
+async def room_websocket(websocket: WebSocket,username: str = Query(...),db: Session = Depends(get_db)):
 
     # -----------------------------------------------------
     # CONNECT ROOM SOCKET
     # -----------------------------------------------------
+
     connected = await manager.connect_room(websocket,username)
 
     if not connected:
@@ -569,148 +569,392 @@ async def room_websocket(websocket: WebSocket,username: str = Query(...)):
 
     try:
 
+        # -------------------------------------------------
+        # CHECK USER EXISTS
+        # -------------------------------------------------
+
+        result = db.execute(select(User).where(User.username == username))
+
+        user = result.scalar_one_or_none()
+
+        if user is None:
+
+            await websocket.send_json({
+                "type": "error",
+                "message": f"User '{username}' does not exist"
+            })
+
+            manager.disconnect_room(username)
+            return
+
+        # -------------------------------------------------
+        # LOAD USER'S EXISTING ROOM MEMBERSHIPS
+        # -------------------------------------------------
+
+        membership_query = (
+            select(RoomMember, Room)
+            .join(Room,Room.id == RoomMember.room_id)
+            .where(RoomMember.user_id == user.id)
+        )
+
+        membership_result = db.execute(membership_query)
+
+        existing_memberships = membership_result.all()
+
+        for membership, room in existing_memberships:
+
+            manager.join_room(username,room.name)
+
+        print(
+            f"{username} restored rooms: "
+            f"{[room.name for _, room in existing_memberships]}"
+        )
+
+        # -------------------------------------------------
+        # RECEIVE ROOM MESSAGES
+        # -------------------------------------------------
+
         while True:
 
             data = await websocket.receive_json()
+
             message_type = data.get("type")
 
-            # ---------------------------------------------
+            # =================================================
             # JOIN ROOM
-            # ---------------------------------------------
+            # =================================================
 
             if message_type == "join_room":
-                room = data.get("room")
-                # Room name required
-                if not room:
-                    await websocket.send_json({
-                        "type":"error",
-                        "message":"Room name is required"
-                    })
-                    continue
 
-                # Add user to room
-                manager.join_room(username,room)
+                room_name = data.get("room")
 
-                # Confirm room join
-                await websocket.send_json({
-                    "type":"room_joined",
-                    "username":username,
-                    "room":room
-                })
+                # ---------------------------------------------
+                # VALIDATE ROOM NAME
+                # ---------------------------------------------
 
-                await manager.notify_room_members(
-                    room,
-                    {
-                        "type":"user_joined_room",
-                        "username":username,
-                        "room":room
-                    },
-                    exclude_username=username
-                )
+                if not room_name:
 
-                continue
-
-            # ---------------------------------------------
-            # LEAVE ROOM
-            # ---------------------------------------------
-
-            if message_type == "leave_room":
-                room = data.get("room")
-                if not room:
                     await websocket.send_json({
                         "type": "error",
                         "message": "Room name is required"
                     })
-                    continue
-                if room not in manager.rooms:
-                    await websocket.send_json({
-                        "type":"error",
-                        "message":f"Room '{room}' ""does not exist"
-                    })
+
                     continue
 
+                # ---------------------------------------------
+                # CHECK ROOM EXISTS
+                # ---------------------------------------------
 
-                if username not in manager.rooms[room]:
+                result = db.execute(select(Room).where(Room.name == room_name))
 
-                    await websocket.send_json({
-                        "type":"error",
-                        "message":f"User '{username}' "f"is not a member of '{room}'"
-                    })
-                    continue
+                room = result.scalar_one_or_none()
 
-                await manager.notify_room_members(
-                    room,
-                    {
-                        "type":"user_left_room",
-                        "username":username,
-                        "room":room
-                    },
-                    exclude_username=username
+                # ---------------------------------------------
+                # CREATE ROOM IF IT DOES NOT EXIST
+                # ---------------------------------------------
+
+                if room is None:
+
+                    room = Room(name=room_name)
+
+                    db.add(room)
+                    db.commit()
+                    db.refresh(room)
+
+                    print(
+                        f"Room '{room_name}' "
+                        f"created in database"
+                    )
+
+                # ---------------------------------------------
+                # CHECK EXISTING MEMBERSHIP
+                # ---------------------------------------------
+
+                result = db.execute(
+                    select(RoomMember).where(
+                        RoomMember.room_id == room.id,
+                        RoomMember.user_id == user.id
+                    )
                 )
 
-                manager.leave_room(username,room)
+                membership = result.scalar_one_or_none()
 
-                await websocket.send_json({
-                    "type": "room_left",
-                    "username": username,
-                    "room": room
-                })
+                if membership is not None:
 
-                continue
-
-            # ---------------------------------------------
-            # ROOM MESSAGE
-            # ---------------------------------------------
-
-            if message_type == "room_message":
-                room = data.get("room")
-                message = data.get("message")
-
-                # Validate room
-                if not room:
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": "Room name is required"
-                    })
-                    continue
-
-                # Validate message
-                if not message:
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": "Message is required"
-                    })
-                    continue
-
-                # Check whether user belongs to room
-                if room not in manager.rooms:
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": f"Room '{room}' does not exist"
-                    })
-
-                    continue
-
-                if username not in manager.rooms[room]:
                     await websocket.send_json({
                         "type": "error",
                         "message": (
                             f"User '{username}' "
-                            f"is not a member of '{room}'"
+                            f"is already a member of "
+                            f"'{room_name}'"
                         )
+                    })
+
+                    continue
+
+                # ---------------------------------------------
+                # CREATE MEMBERSHIP
+                # ---------------------------------------------
+
+                membership = RoomMember(room_id=room.id,user_id=user.id)
+
+                db.add(membership)
+                db.commit()
+
+                # ---------------------------------------------
+                # UPDATE CONNECTION MANAGER
+                # ---------------------------------------------
+
+                manager.join_room(username,room_name)
+
+                # ---------------------------------------------
+                # CONFIRM JOIN
+                # ---------------------------------------------
+
+                await websocket.send_json({
+                    "type": "room_joined",
+                    "username": username,
+                    "room": room_name
+                })
+
+                # ---------------------------------------------
+                # NOTIFY OTHER MEMBERS
+                # ---------------------------------------------
+
+                await manager.notify_room_members(
+                    room_name,
+                    {
+                        "type": "user_joined_room",
+                        "username": username,
+                        "room": room_name
+                    },
+                    exclude_username=username
+                )
+
+                continue
+
+            # =================================================
+            # LEAVE ROOM
+            # =================================================
+
+            if message_type == "leave_room":
+
+                room_name = data.get("room")
+                if not room_name:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "Room name is required"
                     })
                     continue
 
-                # Broadcast message
+                # ---------------------------------------------
+                # CHECK ROOM
+                # ---------------------------------------------
+
+                result = db.execute(
+                    select(Room).where(
+                        Room.name == room_name
+                    )
+                )
+
+                room = result.scalar_one_or_none()
+
+                if room is None:
+
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": (
+                            f"Room '{room_name}' "
+                            f"does not exist"
+                        )
+                    })
+
+                    continue
+
+                # ---------------------------------------------
+                # CHECK MEMBERSHIP
+                # ---------------------------------------------
+
+                result = db.execute(
+                    select(RoomMember).where(
+                        RoomMember.room_id == room.id,
+                        RoomMember.user_id == user.id
+                    )
+                )
+
+                membership = result.scalar_one_or_none()
+
+                if membership is None:
+
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": (
+                            f"User '{username}' "
+                            f"is not a member of "
+                            f"'{room_name}'"
+                        )
+                    })
+
+                    continue
+
+                # ---------------------------------------------
+                # NOTIFY OTHER MEMBERS
+                # ---------------------------------------------
+
+                await manager.notify_room_members(
+                    room_name,
+                    {
+                        "type": "user_left_room",
+                        "username": username,
+                        "room": room_name
+                    },
+                    exclude_username=username
+                )
+
+                # ---------------------------------------------
+                # REMOVE DATABASE MEMBERSHIP
+                # ---------------------------------------------
+
+                db.delete(membership)
+                db.commit()
+
+                # ---------------------------------------------
+                # REMOVE FROM MEMORY
+                # ---------------------------------------------
+
+                manager.leave_room(username,room_name)
+
+                # ---------------------------------------------
+                # CONFIRM LEAVE
+                # ---------------------------------------------
+
+                await websocket.send_json({
+                    "type": "room_left",
+                    "username": username,
+                    "room": room_name
+                })
+
+                continue
+
+            # =================================================
+            # ROOM MESSAGE
+            # =================================================
+
+            if message_type == "room_message":
+
+                room_name = data.get("room")
+                message = data.get("message")
+
+                # ---------------------------------------------
+                # VALIDATE ROOM
+                # ---------------------------------------------
+
+                if not room_name:
+
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "Room name is required"
+                    })
+
+                    continue
+
+                # ---------------------------------------------
+                # VALIDATE MESSAGE
+                # ---------------------------------------------
+
+                if not message:
+
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "Message is required"
+                    })
+
+                    continue
+
+                # ---------------------------------------------
+                # CHECK ROOM EXISTS
+                # ---------------------------------------------
+
+                result = db.execute(
+                    select(Room).where(
+                        Room.name == room_name
+                    )
+                )
+
+                room = result.scalar_one_or_none()
+
+                if room is None:
+
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": (
+                            f"Room '{room_name}' "
+                            f"does not exist"
+                        )
+                    })
+
+                    continue
+
+                # ---------------------------------------------
+                # CHECK USER MEMBERSHIP
+                # ---------------------------------------------
+
+                result = db.execute(
+                    select(RoomMember).where(
+                        RoomMember.room_id == room.id,
+                        RoomMember.user_id == user.id
+                    )
+                )
+
+                membership = result.scalar_one_or_none()
+
+                if membership is None:
+
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": (
+                            f"User '{username}' "
+                            f"is not a member of "
+                            f"'{room_name}'"
+                        )
+                    })
+
+                    continue
+
+                # ---------------------------------------------
+                # SAVE ROOM MESSAGE
+                # ---------------------------------------------
+
+                new_room_message = RoomMessage(
+                    room_id=room.id,
+                    sender_id=user.id,
+                    message=message
+                )
+
+                db.add(new_room_message)
+                db.commit()
+                db.refresh(new_room_message)
+
+                # ---------------------------------------------
+                # BROADCAST MESSAGE
+                # ---------------------------------------------
+
                 await manager.broadcast_to_room(
-                    room,
+                    room_name,
                     {
                         "type": "room_message",
-                        "room": room,
+                        "id": new_room_message.id,
+                        "room": room_name,
                         "from": username,
-                        "message": message
+                        "message": message,
+                        "created_at": (
+                            new_room_message.created_at.isoformat()
+                            if new_room_message.created_at
+                            else None
+                        )
                     }
                 )
+
                 continue
 
             # =================================================
@@ -718,72 +962,331 @@ async def room_websocket(websocket: WebSocket,username: str = Query(...)):
             # =================================================
 
             if message_type == "get_room_members":
-                room = data.get("room")
 
-                if not room:
+                room_name = data.get("room")
+
+                if not room_name:
+
                     await websocket.send_json({
-                        "type":"error",
-                        "message":"Room name is required"
+                        "type": "error",
+                        "message": "Room name is required"
                     })
+
                     continue
 
-                # -------------------------------------------------
+                # ---------------------------------------------
                 # CHECK ROOM EXISTS
-                # -------------------------------------------------
+                # ---------------------------------------------
 
-                members = manager.get_room_members(room)
+                result = db.execute(
+                    select(Room).where(
+                        Room.name == room_name
+                    )
+                )
 
-                if members is None:
+                room = result.scalar_one_or_none()
+
+                if room is None:
+
                     await websocket.send_json({
-                        "type":"error",
-                        "message":f"Room '{room}' does not exist"
+                        "type": "error",
+                        "message": (
+                            f"Room '{room_name}' "
+                            f"does not exist"
+                        )
                     })
+
                     continue
 
-                # -------------------------------------------------
+                # ---------------------------------------------
+                # GET MEMBERS FROM DATABASE
+                # ---------------------------------------------
+
+                members_query = (
+                    select(User.username)
+                    .join(
+                        RoomMember,
+                        RoomMember.user_id == User.id
+                    )
+                    .where(RoomMember.room_id == room.id)
+                    .order_by(User.username)
+                )
+
+                members_result = db.execute(members_query)
+
+                members = members_result.scalars().all()
+
+                # ---------------------------------------------
                 # SEND MEMBERS
-                # -------------------------------------------------
+                # ---------------------------------------------
 
                 await websocket.send_json({
-                    "type":"room_members",
-                    "room":room,
-                    "members":members
+                    "type": "room_members",
+                    "room": room_name,
+                    "members": members
                 })
+
                 continue
 
-            # ---------------------------------------------
+            # =================================================
+            # ROOM HISTORY
+            # =================================================
+
+            if message_type == "room_history":
+
+                room_name = data.get("room")
+
+                # ---------------------------------------------
+                # VALIDATE ROOM
+                # ---------------------------------------------
+
+                if not room_name:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "Room name is required"
+                    })
+
+                    continue
+
+                # ---------------------------------------------
+                # GET PAGINATION VALUES
+                # ---------------------------------------------
+
+                limit = data.get("limit", 20)
+                offset = data.get("offset", 0)
+
+                # ---------------------------------------------
+                # VALIDATE LIMIT
+                # ---------------------------------------------
+
+                if not isinstance(limit, int) or limit <= 0:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "Limit must be a positive integer"
+                    })
+
+                    continue
+
+                # Prevent excessively large requests
+                if limit > 100:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "Limit cannot be greater than 100"
+                    })
+
+                    continue
+
+                # ---------------------------------------------
+                # VALIDATE OFFSET
+                # ---------------------------------------------
+
+                if not isinstance(offset, int) or offset < 0:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "Offset must be a non-negative integer"
+                    })
+
+                    continue
+
+                # ---------------------------------------------
+                # CHECK ROOM EXISTS
+                # ---------------------------------------------
+
+                result = db.execute(
+                    select(Room).where(
+                        Room.name == room_name
+                    )
+                )
+
+                room = result.scalar_one_or_none()
+
+                if room is None:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": (
+                            f"Room '{room_name}' "
+                            f"does not exist"
+                        )
+                    })
+
+                    continue
+
+                # ---------------------------------------------
+                # CHECK USER MEMBERSHIP
+                # ---------------------------------------------
+
+                result = db.execute(
+                    select(RoomMember).where(
+                        RoomMember.room_id == room.id,
+                        RoomMember.user_id == user.id
+                    )
+                )
+
+                membership = result.scalar_one_or_none()
+
+                if membership is None:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": (
+                            f"User '{username}' "
+                            f"is not a member of "
+                            f"'{room_name}'"
+                        )
+                    })
+
+                    continue
+
+                # ---------------------------------------------
+                # GET ROOM MESSAGE HISTORY
+                # ---------------------------------------------
+
+                history_query = (
+                    select(RoomMessage, User.username)
+                    .join(
+                        User,
+                        User.id == RoomMessage.sender_id
+                    )
+                    .where(
+                        RoomMessage.room_id == room.id
+                    )
+                    .order_by(
+                        RoomMessage.created_at.asc()
+                    )
+                    .offset(offset)
+                    .limit(limit)
+                )
+
+                history_result = db.execute(
+                    history_query
+                )
+
+                history = history_result.all()
+
+                # ---------------------------------------------
+                # FORMAT MESSAGES
+                # ---------------------------------------------
+
+                messages = []
+
+                for room_message, sender_username in history:
+                    messages.append({
+                        "id": room_message.id,
+                        "sender": sender_username,
+                        "message": room_message.message,
+                        "created_at": (
+                            room_message.created_at.isoformat()
+                            if room_message.created_at
+                            else None
+                        )
+                    })
+
+                # ---------------------------------------------
+                # CHECK WHETHER MORE MESSAGES EXIST
+                # ---------------------------------------------
+
+                next_offset = offset + len(messages)
+
+                has_more = len(messages) == limit
+
+                # ---------------------------------------------
+                # SEND HISTORY
+                # ---------------------------------------------
+
+                await websocket.send_json({
+                    "type": "room_history",
+                    "room": room_name,
+                    "messages": messages,
+                    "limit": limit,
+                    "offset": offset,
+                    "next_offset": next_offset,
+                    "has_more": has_more
+                })
+
+                continue
+
+            # =========================================================
+            # FUTURE IMPROVEMENT: CURSOR-BASED PAGINATION
+            # =========================================================
+            #
+            # Current implementation uses:
+            #
+            #     limit
+            #     offset
+            #
+            # Example:
+            #
+            # {
+            #     "type": "room_history",
+            #     "room": "developer",
+            #     "limit": 20,
+            #     "offset": 0
+            # }
+            #
+            # Future implementation can use cursor-based pagination:
+            #
+            # {
+            #     "type": "room_history",
+            #     "room": "developer",
+            #     "limit": 20,
+            #     "before_id": 100
+            # }
+            #
+            # This would allow fetching older messages based on the
+            # message ID instead of using OFFSET.
+            #
+            # Cursor-based pagination is better suited for very large
+            # chat histories because OFFSET can become expensive as
+            # the number of messages grows.
+            #
+            # =========================================================
+            # =================================================
             # UNKNOWN MESSAGE TYPE
-            # ---------------------------------------------
+            # =================================================
 
             await websocket.send_json({
                 "type": "error",
                 "message": "Unknown room message type"
             })
 
-            continue
-
-
     except WebSocketDisconnect:
-        # Get rooms before removing the user
+
+        # ---------------------------------------------
+        # GET CURRENT ROOMS
+        # ---------------------------------------------
+
         rooms_left = manager.get_user_rooms(username)
 
-        # Notify remaining members
-        for room in rooms_left:
+        # ---------------------------------------------
+        # NOTIFY OTHER MEMBERS
+        # ---------------------------------------------
+
+        for room_name in rooms_left:
+
             await manager.notify_room_members(
-                room,
+                room_name,
                 {
                     "type": "user_left_room",
                     "username": username,
-                    "room": room
+                    "room": room_name
                 },
                 exclude_username=username
             )
 
-        # Remove room WebSocket connection
+        # ---------------------------------------------
+        # REMOVE LIVE CONNECTION
+        # ---------------------------------------------
+
         manager.disconnect_room(username)
 
-        # Remove user from every room
+        # ---------------------------------------------
+        # REMOVE FROM IN-MEMORY ROOMS
+        # ---------------------------------------------
+
         manager.leave_all_rooms(username)
+
+        # IMPORTANT:
+        # Do NOT delete RoomMember records here.
+        # Database membership should survive a disconnect.
 
         print(
             f"{username} disconnected "
@@ -791,7 +1294,7 @@ async def room_websocket(websocket: WebSocket,username: str = Query(...)):
         )
 
         print(
-            f"{username} removed from rooms: "
+            f"{username} removed from live rooms: "
             f"{rooms_left}"
         )
 
