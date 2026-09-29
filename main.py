@@ -148,7 +148,12 @@ from pydantic import ValidationError
 
 from connectionManager import ConnectionManager
 from models import ChatModel
+from sqlalchemy import select, or_, and_
+from sqlalchemy.orm import Session
+from fastapi import Depends
 
+from database.database import get_db
+from database.models import User, Message
 
 manager = ConnectionManager()
 
@@ -175,10 +180,7 @@ async def home():
 # =========================================================
 
 @app.websocket("/ws/chat")
-async def websocket_endpoint(
-    websocket: WebSocket,
-    username: str = Query(...)
-):
+async def websocket_endpoint(websocket: WebSocket,username: str = Query(...),db: Session = Depends(get_db)):
 
     # -----------------------------------------------------
     # CONNECT USER
@@ -190,8 +192,64 @@ async def websocket_endpoint(
     if not connected:
         return
 
+    # Check whether user already exists
+    result = db.execute(select(User).where(User.username == username))
+
+    user = result.scalar_one_or_none()
+
+    # Create user if this is the first connection
+    if user is None:
+        user = User(username=username)
+
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+        print(f"User '{username}' created in database")
+
+    else:
+        print(f"User '{username}' already exists in database")
+
+    # Stop if duplicate username
+    if not connected:
+        return
+
     print(f"{username} connected")
 
+    # -----------------------------------------------------
+    # DELIVER PENDING MESSAGES
+    # -----------------------------------------------------
+
+    pending_query = select(Message).where(
+        Message.receiver == username,
+        Message.delivered == False
+    ).order_by(Message.created_at.asc())
+
+    pending_result = db.execute(pending_query)
+
+    pending_messages = pending_result.scalars().all()
+
+    for pending_message in pending_messages:
+
+        sent = await manager.send_personal_message(
+            {
+                "type": "offline_message",
+                "id": pending_message.id,
+                "from": pending_message.sender,
+                "to": pending_message.receiver,
+                "message": pending_message.message,
+                "created_at":
+                    pending_message.created_at.isoformat()
+                    if pending_message.created_at
+                    else None
+            },
+            username
+        )
+
+        if sent:
+            pending_message.delivered = True
+
+    db.commit()
     # -----------------------------------------------------
     # USER JOINED
     # -----------------------------------------------------
@@ -216,6 +274,51 @@ async def websocket_endpoint(
             data = await websocket.receive_json()
 
             print(data)
+            if data.get("type") == "chat_history":
+
+                other_user = data.get("with")
+
+                if not other_user:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "The 'with' field is required"
+                    })
+                    continue
+
+                query = select(Message).where(
+                    or_(
+                        and_(
+                            Message.sender == username,
+                            Message.receiver == other_user
+                        ),
+                        and_(
+                            Message.sender == other_user,
+                            Message.receiver == username
+                        )
+                    )
+                ).order_by(Message.created_at.asc())
+
+                result = db.execute(query)
+
+                messages = result.scalars().all()
+
+                await websocket.send_json({
+                    "type": "chat_history",
+                    "with": other_user,
+                    "messages": [
+                        {
+                            "id": msg.id,
+                            "sender": msg.sender,
+                            "receiver": msg.receiver,
+                            "message": msg.message,
+                            "created_at": msg.created_at.isoformat()
+                            if msg.created_at else None
+                        }
+                        for msg in messages
+                    ]
+                })
+
+                continue
 
             # -------------------------------------------------
             # VALIDATE MESSAGE
@@ -245,31 +348,153 @@ async def websocket_endpoint(
 
             message = chat_message.message
 
+            # # -------------------------------------------------
+            # # SEND PRIVATE MESSAGE
+            # # -------------------------------------------------
+            #
+            # #Save to the DB
+            # new_message = Message(
+            #     sender=username,
+            #     receiver=recipient,
+            #     message=message
+            # )
+            # db.add(new_message)
+            # db.commit()
+            # db.refresh(new_message)
+            #
+            # #send to websocket
+            # sent = await manager.send_personal_message(
+            #     {
+            #         "type":"private_message",
+            #         "from":username,
+            #         "to":recipient,
+            #         "message":message
+            #     },
+            #     recipient)
+            #
+            # # -------------------------------------------------
+            # # RECIPIENT NOT CONNECTED
+            # # -------------------------------------------------
+            #
+            # if not sent:
+            #     await websocket.send_json({
+            #         "type":
+            #             "error",
+            #         "message":
+            #             f"User '{recipient}' is not connected"
+            #     })
             # -------------------------------------------------
-            # SEND PRIVATE MESSAGE
+            # CHECK WHETHER RECIPIENT EXISTS
             # -------------------------------------------------
 
-            sent = await manager.send_personal_message(
-                {
-                    "type":"private_message",
-                    "from":username,
-                    "to":recipient,
-                    "message":message
-                },
-                recipient)
+            result = db.execute(
+                select(User).where(User.username == recipient)
+            )
 
-            # -------------------------------------------------
-            # RECIPIENT NOT CONNECTED
-            # -------------------------------------------------
+            recipient_user = result.scalar_one_or_none()
 
-            if not sent:
+            if recipient_user is None:
                 await websocket.send_json({
-                    "type":
-                        "error",
-                    "message":
-                        f"User '{recipient}' is not connected"
+                    "type": "error",
+                    "message": f"User '{recipient}' does not exist"
                 })
 
+                continue
+
+            # -------------------------------------------------
+            # CHECK WHETHER RECIPIENT IS ONLINE
+            # -------------------------------------------------
+
+            recipient_online = recipient in manager.active_connections
+
+            # -------------------------------------------------
+            # SAVE MESSAGE
+            # -------------------------------------------------
+
+            new_message = Message(
+                sender=username,
+                receiver=recipient,
+                message=message,
+                delivered=False
+            )
+
+            db.add(new_message)
+            db.commit()
+            db.refresh(new_message)
+
+            # -------------------------------------------------
+            # RECIPIENT ONLINE
+            # -------------------------------------------------
+
+            if recipient_online:
+
+                sent = await manager.send_personal_message(
+                    {
+                        "type": "private_message",
+                        "id": new_message.id,
+                        "from": username,
+                        "to": recipient,
+                        "message": message
+                    },
+                    recipient
+                )
+
+                if sent:
+                    new_message.delivered = True
+
+                    db.commit()
+
+            else:
+
+                # Recipient is offline.
+                # Message remains delivered=False.
+
+                await websocket.send_json({
+                    "type": "message_queued",
+                    "message":
+                        f"User '{recipient}' is offline. "
+                        "Message saved for delivery."
+                })
+
+            # # -------------------------------------------------
+            # # CHECK WHETHER RECIPIENT IS CONNECTED
+            # # -------------------------------------------------
+            #
+            # if recipient not in manager.active_connections:
+            #     await websocket.send_json({
+            #         "type": "error",
+            #         "message": f"User '{recipient}' is not connected"
+            #     })
+            #
+            #     continue
+            #
+            # # -------------------------------------------------
+            # # SAVE MESSAGE TO DATABASE
+            # # -------------------------------------------------
+            #
+            # new_message = Message(
+            #     sender=username,
+            #     receiver=recipient,
+            #     message=message
+            # )
+            #
+            # db.add(new_message)
+            # db.commit()
+            # db.refresh(new_message)
+            #
+            # # -------------------------------------------------
+            # # SEND PRIVATE MESSAGE
+            # # -------------------------------------------------
+            #
+            # sent = await manager.send_personal_message(
+            #     {
+            #         "type": "private_message",
+            #         "from": username,
+            #         "to": recipient,
+            #         "message": message
+            #     },
+            #     recipient
+            # )
     # -----------------------------------------------------
     # USER DISCONNECTED
     # -----------------------------------------------------
