@@ -144,10 +144,11 @@ from fastapi import (
     Query
 )
 
-from pydantic import ValidationError
+from auth.security import hash_password, verify_password, create_access_token, verify_access_token
 
+from pydantic import ValidationError
 from connectionManager import ConnectionManager
-from models import ChatModel
+from models import ChatModel, RegisterRequest, LoginRequest
 from sqlalchemy import select, or_, and_
 from sqlalchemy.orm import Session
 from fastapi import Depends
@@ -168,23 +169,117 @@ app = FastAPI(
 # =========================================================
 
 @app.get("/")
-async def home():
-
+def home():
     return {
         "message": "Chat server is running"
     }
 
+
+@app.post("/auth/register")
+def register_user(request: RegisterRequest,db: Session = Depends(get_db)):
+    username = request.username.strip()
+    password = request.password
+
+    if not username:
+        return {
+            "success": False,
+            "message": "Username is required"
+        }
+
+    if not password:
+        return {
+            "success": False,
+            "message": "Password is required"
+        }
+
+    existing_user = db.execute(
+        select(User).where(User.username == username)
+    ).scalar_one_or_none()
+
+    if existing_user:
+        return {
+            "success": False,
+            "message": "Username already exists"
+        }
+
+    password_hash = hash_password(password)
+
+    user = User(
+        username=username,
+        password_hash=password_hash
+    )
+
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    return {
+        "success": True,
+        "message": "User registered successfully",
+        "user": {
+            "id": user.id,
+            "username": user.username
+        }
+    }
+
+
+@app.post("/auth/login")
+def login_user(request: LoginRequest,db: Session = Depends(get_db)):
+    username = request.username.strip()
+
+    user = db.execute(
+        select(User).where(User.username == username)
+    ).scalar_one_or_none()
+
+    if not user:
+        return {
+            "success": False,
+            "message": "Invalid username or password"
+        }
+
+    if not user.password_hash:
+        return {
+            "success": False,
+            "message": "User does not have a password"
+        }
+
+    if not verify_password(request.password, user.password_hash):
+        return {
+            "success": False,
+            "message": "Invalid username or password"
+        }
+
+    access_token = create_access_token(user.username)
+
+    return {
+        "success": True,
+        "message": "Login successful",
+        "access_token": access_token,
+        "token_type": "bearer"
+    }
 
 # =========================================================
 # PERSONAL CHAT
 # =========================================================
 
 @app.websocket("/ws/chat")
-async def websocket_endpoint(websocket: WebSocket,username: str = Query(...),db: Session = Depends(get_db)):
+async def websocket_endpoint(websocket: WebSocket, token: str,db: Session = Depends(get_db)): #username: str = Query(...) removed for authentication via token
 
     # -----------------------------------------------------
     # CONNECT USER
     # -----------------------------------------------------
+    username = verify_access_token(token)
+
+    if not username:
+        await websocket.accept()
+        await websocket.send_json({
+            "type": "error",
+            "message": "Invalid or expired token"
+        })
+
+        await websocket.close(code=1008)
+
+        return
 
     connected = await manager.connect(websocket,username)
 
