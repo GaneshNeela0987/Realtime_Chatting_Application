@@ -616,9 +616,21 @@ async def websocket_endpoint(websocket: WebSocket, token: str,db: Session = Depe
 # =========================================================
 
 @app.websocket("/ws/online")
-async def online_users(
-    websocket: WebSocket
-):
+async def online_users(websocket: WebSocket, token: str):
+
+    username = verify_access_token(token)
+
+    if not username:
+        await websocket.accept()
+
+        await websocket.send_json({
+            "type": "error",
+            "message": "Invalid or expired token"
+        })
+
+        await websocket.close(code=1008)
+
+        return
 
     # Register presence connection
     await manager.connect_online(websocket)
@@ -649,11 +661,24 @@ async def online_users(
 # =========================================================
 
 @app.websocket("/ws/room")
-async def room_websocket(websocket: WebSocket,username: str = Query(...),db: Session = Depends(get_db)):
+async def room_websocket(websocket: WebSocket, token: str,db: Session = Depends(get_db)): # username: str = Query(...) replaced with token for security
 
     # -----------------------------------------------------
     # CONNECT ROOM SOCKET
     # -----------------------------------------------------
+    username = verify_access_token(token)
+
+    if not username:
+        await websocket.accept()
+
+        await websocket.send_json({
+            "type": "error",
+            "message": "Invalid or expired token"
+        })
+
+        await websocket.close(code=1008)
+
+        return
 
     connected = await manager.connect_room(websocket,username)
 
@@ -1091,6 +1116,21 @@ async def room_websocket(websocket: WebSocket,username: str = Query(...),db: Ses
                         )
                     })
 
+                    continue
+
+                # Authorization: user must be a member of the room
+                membership = db.execute(
+                    select(RoomMember).where(
+                        RoomMember.room_id == room.id,
+                        RoomMember.user_id == user.id
+                    )
+                ).scalar_one_or_none()
+
+                if not membership:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": f"User '{username}' is not a member of '{room_name}'"
+                    })
                     continue
 
                 # ---------------------------------------------
