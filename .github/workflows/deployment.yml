@@ -37,6 +37,7 @@ jobs:
       - name: Run tests
         run: pytest -v
 
+        
   deploy:
     name: Deploy to Render
     runs-on: ubuntu-latest
@@ -52,6 +53,16 @@ jobs:
           RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
         run: |
           test -n "$RENDER_DEPLOY_HOOK_URL"
+
           curl --fail --silent --show-error \
+            --max-time 30 \
             --request POST \
             "$RENDER_DEPLOY_HOOK_URL"
+
+          echo "Render deployment triggered successfully."
+
+      - name: Wait for Render deployment
+        run: |
+          echo "Waiting 180 seconds for Render to deploy..."
+          sleep 180
+          echo "Wait completed."
