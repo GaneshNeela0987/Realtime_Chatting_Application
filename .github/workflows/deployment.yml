@@ -52,17 +52,18 @@ jobs:
         env:
           RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
         run: |
+          set -e
+
           test -n "$RENDER_DEPLOY_HOOK_URL"
 
           curl --fail --silent --show-error \
             --max-time 30 \
-            --request POST \
             "$RENDER_DEPLOY_HOOK_URL"
 
           echo "Render deployment triggered successfully."
 
       - name: Wait for Render deployment
         run: |
-          echo "Waiting 180 seconds for Render to deploy..."
+          echo "Waiting 180 seconds..."
           sleep 180
           echo "Wait completed."
